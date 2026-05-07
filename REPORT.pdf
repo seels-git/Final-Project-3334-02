@@ -1,0 +1,102 @@
+# Design Report — Concurrent Task Dispatcher
+ 
+## 1. Architecture and Thread Roles
+ 
+The system has six categories of threads with clearly separated responsibilities:
+ 
+**Generator thread.** Holds a list of tasks pre-sorted by arrival time. It sleeps until the next task is "due" (simulating real-time arrival), then pushes it to the CPU or IO queue as appropriate. When all tasks have been dispatched it sends a `()` signal on a `SyncSender` to unblock the main thread.
+ 
+**CPU worker threads (×6).** Each worker blocks on `TaskQueue::pop_or_closed()`, which uses a `Condvar` to sleep until a task arrives. The worker stamps the task's `start_time`, calls `thread::sleep(task.duration)` to simulate execution, stamps `completion_time`, and sends a `CompletedTask` record to the collector via `mpsc::Sender`. When the queue is closed and drained the worker returns `None` from `pop_or_closed` and exits.
+ 
+**IO worker threads (×4).** Identical logic to CPU workers but pull exclusively from the IO queue.
+ 
+**Monitor thread.** Wakes every 50 ms, snapshots `(cpu_queue.len(), io_queue.len())`, and appends the sample to the shared `Metrics` struct under a `Mutex`. Exits when it receives a stop signal after all workers have finished.
+ 
+**Collector thread.** Owns the `Receiver<CompletedTask>` end of the completion channel. As worker threads finish tasks they send records; the collector aggregates them into `Metrics`. The loop exits automatically when the channel's last `Sender` is dropped (i.e., all workers have exited), making the collector's shutdown implicit and bug-free.
+ 
+**Main thread.** Orchestrates startup sequence, waits for the generator to finish, closes queues, joins all threads, stops the monitor, and prints the final report.
+ 
+---
+ 
+## 2. Shared Data and Protection
+ 
+| Shared Data | Type | Protection |
+|---|---|---|
+| CPU ready queue | `BinaryHeap<PrioritizedTask>` | `Arc<(Mutex<QueueInner>, Condvar)>` inside `TaskQueue` |
+| IO ready queue | same | same |
+| Metrics | `Metrics` struct | `Arc<Mutex<Metrics>>` |
+| Active worker count | `AtomicUsize` | lock-free `Arc<AtomicUsize>` |
+ 
+`TaskQueue` is the most critical shared structure. It wraps the heap in a `Mutex` and pairs it with a `Condvar` so that workers can block efficiently instead of spin-polling. Cloning a `TaskQueue` produces another handle to the *same* underlying `Arc`, which is how the generator and all workers share a single queue without unsafe code.
+ 
+`Metrics` uses a coarser `Mutex` because it is written infrequently (once per completed task, once per monitor interval) and read only at the end. A finer-grained lock would add complexity without measurable benefit.
+ 
+---
+ 
+## 3. Channels vs Shared State
+ 
+**Channels are used for:**
+- Generator → main: the "done" signal. A `SyncSender<()>` with capacity 1 is enough; the main thread blocks on `recv()`.
+- Workers → collector: completed task records. `mpsc::channel` gives each worker a cheap `Sender` clone; the collector owns the single `Receiver` and processes records sequentially. This avoids locking `Metrics` on the hot path inside every worker thread.
+- Main → monitor: the stop signal. A regular `mpsc::channel<()>` whose sender is dropped when main wants the monitor to exit.
+**Shared state (`Arc<Mutex<_>>`) is used for:**
+- The task queues. Many threads push and pop concurrently, and the `Condvar` must be paired with the `Mutex`. A channel would force a separate dispatcher thread to mediate between producers and consumers, adding latency.
+- Metrics. The monitor thread samples queue lengths (it needs live handles to the queues) and writes queue depth samples into `Metrics`. Routing those samples through a channel would require an extra message type and a more complex collector.
+---
+ 
+## 4. Scheduling Policy
+ 
+**Policy: Priority-based dispatch with FIFO tie-breaking, within a class-reserved worker pool.**
+ 
+Each `TaskQueue` is a `BinaryHeap<PrioritizedTask>`. The `Ord` implementation orders tasks by:
+1. `priority` descending (5 > 4 > … > 1)
+2. `arrival_time` ascending (earlier arrival wins among equal-priority tasks)
+This gives strict priority scheduling with FIFO fairness within a priority level.
+ 
+The worker pool is split: 6 CPU workers pull exclusively from the CPU queue; 4 IO workers pull exclusively from the IO queue. This is the "reserve some workers for each task class" policy from the handout.
+ 
+**Why this policy?**
+A single shared queue with a homogeneous worker pool is simpler, but:
+- A burst of long CPU tasks would fill the shared queue and force IO tasks (which could finish in a few milliseconds) to wait behind them. This is head-of-line blocking.
+- Priority without class separation means a low-priority IO task can still be blocked by high-priority CPU tasks simply because the CPU workers are busy.
+With reserved pools, the worst case for IO tasks is "all 4 IO workers are busy" — unrelated to how saturated the CPU queue is.
+ 
+**What improved:** IO task wait times remain bounded even under CPU-heavy stress. Experiment B shows IO avg wait of 622 ms vs CPU avg wait of 3369 ms — a significant protection.
+ 
+**What became harder:** Sizing the pool split is a tuning problem. If the workload is 85% CPU (Experiment B) and the pool is only 60% CPU workers, the CPU queue backs up massively (max depth 534). A dynamic split or work-stealing would handle this better, at the cost of more complex synchronization.
+ 
+---
+ 
+## 5. Concurrency Bug Encountered During Development
+ 
+**Bug:** An early version of `TaskQueue` used a `Mutex<VecDeque>` with workers running a busy-wait loop:
+ 
+```rust
+loop {
+    if let Some(task) = queue.lock().unwrap().pop_front() {
+        break task;
+    }
+    thread::sleep(Duration::from_millis(1));
+}
+```
+ 
+This caused two problems:
+1. Workers consumed ~100% CPU on their core while polling, even when the queue was empty and would remain empty for seconds.
+2. The 1 ms sleep introduced up to 1 ms of artificial latency on every task pickup, inflating wait times.
+**Fix:** Replaced with `Mutex<QueueInner>` + `Condvar`. Workers call `cvar.wait(guard)` when the queue is empty, which atomically releases the lock and puts the thread to sleep. The generator calls `cvar.notify_one()` after each push, waking exactly one waiting worker. This is the classic producer-consumer pattern. CPU usage dropped to near zero when the queue is idle.
+ 
+---
+ 
+## 6. Where Starvation or Unfairness Could Still Occur
+ 
+1. **Low-priority task starvation.** A continuous stream of priority-5 tasks could indefinitely delay a priority-1 task. The current design has no aging mechanism. To fix this, the `PrioritizedTask::Ord` could include a "boosted priority" field that increments over time.
+2. **IO worker under-utilization in CPU-heavy workloads.** In Experiment B, IO workers 6–9 each processed only ~27 tasks while CPU workers processed ~100. The 4 idle IO workers cannot help the saturated CPU queue because workers are class-restricted. Work-stealing — where an idle IO worker can pull from the CPU queue when the IO queue is empty — would address this.
+3. **Queue depth imbalance in balanced workloads.** Experiment A showed the IO queue averaging depth 37.6 vs CPU queue depth 1.1, even though task counts were equal. This is because IO tasks' durations sample from the same distribution as CPU tasks, but IO workers are fewer (4 vs 6). Adjusting the split to 5/5 or tracking per-class completion rates and adjusting dynamically would improve fairness.
+---
+ 
+## 7. Lessons Learned
+ 
+- **`Condvar` is essential for blocking queues.** Busy-waiting looks simpler but wastes CPU and adds latency. The Condvar pattern should be a first instinct, not a refactor.
+- **Separation of concerns makes shutdown simple.** Because the collector's lifetime is tied to the channel (it exits when all senders drop), there is no explicit "stop the collector" step. The shutdown sequence becomes: close queues → workers drain and exit → channel closes → collector exits. Each thread cleans up after the thread that fed it.
+- **Two queues are worth the extra code.** The fairness improvement for IO tasks in stressed conditions is dramatic and observable in the metrics.
+- **Fixed pool splits require workload knowledge.** The 6/4 split was chosen for a balanced workload. A self-tuning system would measure per-class queue depth and shift workers accordingly.
